@@ -24,6 +24,7 @@ from Crypto.Util.Padding import pad, unpad
 import utc_sys_pb2_v4 as utc_sys_pb2
 import yj751_sys_pb2_v4 as yj751_sys_pb2
 import pd303_pb2_v4 as pd303_pb2
+import pr705_pb2
 
 # When you device is bond to your account - it's storing the user_id,
 # which is on of the keys in auth procedure, so UserID need to be extracted.
@@ -71,10 +72,11 @@ class SmartBackupMode:
 
 class Device:
     MANUFACTURER_KEY = 0xb5b5
-    SUPPORTED_DEVICES = (
+    SUPPORTED_DEVICES = {
         b'HD31', # Smart Home Panel 2
         b'Y711', # Delta Pro Ultra
-    )
+        b'R6',   # River 3
+    }
 
     @staticmethod
     def New(ble_dev, adv_data):
@@ -95,7 +97,7 @@ class Device:
         # Looking for device SN
         man_data = adv_data.manufacturer_data[Device.MANUFACTURER_KEY]
         sn = man_data[1:17]
-        if sn[0:4] in Device.SUPPORTED_DEVICES:
+        if sn[0:2] in Device.SUPPORTED_DEVICES:
             self._sn = sn.decode('ASCII')
             print("%s: Parsed SN: %s" % (self._address, self._sn))
         else:
@@ -435,7 +437,8 @@ class Connection:
             print("%s: ParseEncPackets: decrypted payload: %r" % (self._address, bytearray(payload).hex()))
 
             # Parse packet - Y needs xor
-            packet = Packet.fromBytes(payload, self._dev_sn.startswith('Y711'))
+            is_xor = self._dev_sn.startswith('Y711') or self._dev_sn.startswith("R6")
+            packet = Packet.fromBytes(payload, is_xor=is_xor)
             if packet != None:
                 packets.append(packet)
 
@@ -717,7 +720,12 @@ class Connection:
                 processed = True
                 send_reply = True
                 pass
-
+            elif packet.src == 0x02 and packet.cmdSet == 0xFE and packet.cmdId == 0x15:
+                p = pr705_pb2.DisplayPropertyUpload()
+                p.ParseFromString(packet.payload)
+                processed = True
+                send_reply = False
+                print("pr705 DisplayPropertyUpload:", str(p))
             if send_reply:
                 # We need to resend packets back to device to enable device to send the additional info
                 await self.replyPacket(packet)
