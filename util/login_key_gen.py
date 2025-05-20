@@ -886,5 +886,13 @@ pu+B64Qs3knm1f5iSwNVnsh6ybtO8uXVoKa/ceT1mQPzYlIk309o4YHq1ZRKgLJECQqUNq/sHRdj+JYK
 tukPTXo/kV7mQeTIs+gzFap3R0YOWtiN+/5SAEAvfr9e8NenGD7UuAiwwbYNtmyX4STxfx9yZEp92fmQDKBImiVRumkuCm/JJ0R\
 PJCduV5T5BL2FrVnJQE'
 
-with open("login_key.bin", "wb") as file:
-    file.write(base64.b64decode(data))
+def get_key():
+    return base64.b64decode(data)
+
+def write_key():
+    with open("login_key.bin", "wb") as file:
+        file.write(base64.b64decode(data))
+
+
+if __name__ == "__main__":
+    write_key()

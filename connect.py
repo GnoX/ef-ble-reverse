@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 
+import asyncio
+import hashlib
+import struct
 import sys
 import time
-import struct
-import asyncio
+from util import login_key_gen
 
-from bleak import BleakError, BleakScanner
-from bleak.backends.scanner import AdvertisementData
+import ecdsa
+from bleak import BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
 from bleak_retry_connector import (
     MAX_CONNECT_ATTEMPTS,
     BleakClientWithServiceCache,
-    BLEDevice,
     establish_connection,
 )
-
-import hashlib
-import ecdsa
-from fastcrc import crc16, crc8
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
+from fastcrc import crc8, crc16
 
-import utc_sys_pb2_v4 as utc_sys_pb2
-import yj751_sys_pb2_v4 as yj751_sys_pb2
-import pd303_pb2_v4 as pd303_pb2
-import pr705_pb2
+from proto import (
+    pd335_bms_bp_pb2,
+    pd335_sys_pb2,
+    pr705_pb2,
+    pd303_pb2,
+    utc_sys_pb2,
+    yj751_sys_pb2,
+    pr705_pb2,
+)
 
 # When you device is bond to your account - it's storing the user_id,
 # which is on of the keys in auth procedure, so UserID need to be extracted.
@@ -41,9 +47,24 @@ USER_ID = sys.argv[1] if len(sys.argv) > 1 else None
 #ADDRESS = "A1:B2:C3:D4:E5:F6"
 ADDRESS = sys.argv[2] if len(sys.argv) > 2 else None
 
-_login_key = b''
-with open('login_key.bin', 'rb') as file:
-    _login_key = file.read()
+SUPPORTED_DEVICES = {
+    b'HD31', # Smart Home Panel 2
+    b'Y711', # Delta Pro Ultra
+    b'R651',   # River 3
+    b'R653',   # River 3
+    b'R654',   # River 3
+    b'R655',   # River 3
+    b"P351",  # Delta 3 Plus
+    b"HW51",  # Powerstream
+}
+REQUIRES_XOR = [
+    "Y711",
+    "R6",
+    "P351",
+    "HW51",
+]
+
+_login_key = login_key_gen.get_key()
 
 # Storing the found devices here
 located_devices = dict()
@@ -72,11 +93,6 @@ class SmartBackupMode:
 
 class Device:
     MANUFACTURER_KEY = 0xb5b5
-    SUPPORTED_DEVICES = {
-        b'HD31', # Smart Home Panel 2
-        b'Y711', # Delta Pro Ultra
-        b'R6',   # River 3
-    }
 
     @staticmethod
     def New(ble_dev, adv_data):
@@ -97,7 +113,7 @@ class Device:
         # Looking for device SN
         man_data = adv_data.manufacturer_data[Device.MANUFACTURER_KEY]
         sn = man_data[1:17]
-        if sn[0:2] in Device.SUPPORTED_DEVICES:
+        if sn[:4] in SUPPORTED_DEVICES:
             self._sn = sn.decode('ASCII')
             print("%s: Parsed SN: %s" % (self._address, self._sn))
         else:
@@ -124,7 +140,7 @@ class Packet:
     NET_BLE_COMMAND_CMD_CHECK_RET_TIME = 0x53
     NET_BLE_COMMAND_CMD_SET_RET_TIME = 0x52
 
-    NET_BLE_COMMAND_VERSION = 0x03;
+    NET_BLE_COMMAND_VERSION = 0x03
     NET_BLE_COMMAND_IF_TYPE_WIFI_AP = 0x00
     NET_BLE_COMMAND_IF_TYPE_WIFI_STATION = 0x01
     NET_BLE_COMMAND_IF_TYPE_ETH_WAN = 0x10
@@ -317,6 +333,7 @@ class Connection:
         self._ble_dev = ble_dev
         self._address = ble_dev.address
         self._dev_sn = dev_sn
+        print(f"DEV SN: {dev_sn}")
 
         self._retry_on_disconnect = True
         self._disconnected = asyncio.Event()
@@ -437,9 +454,11 @@ class Connection:
             print("%s: ParseEncPackets: decrypted payload: %r" % (self._address, bytearray(payload).hex()))
 
             # Parse packet - Y needs xor
-            is_xor = self._dev_sn.startswith('Y711') or self._dev_sn.startswith("R6")
+            is_xor = any(self._dev_sn.startswith(prefix) for prefix in REQUIRES_XOR)
+            print([(prefix, self._dev_sn.startswith(prefix)) for prefix in REQUIRES_XOR])
+
             packet = Packet.fromBytes(payload, is_xor=is_xor)
-            if packet != None:
+            if packet is not None:
                 packets.append(packet)
 
         return packets
@@ -640,6 +659,7 @@ class Connection:
         packets = await self.parseEncPackets(bytes(recv_data))
 
         for packet in packets:
+            print(packet)
             processed = False
             send_reply = False
 
@@ -719,13 +739,21 @@ class Connection:
                 p.ParseFromString(packet.payload)
                 processed = True
                 send_reply = True
-                pass
+                print(p)
             elif packet.src == 0x02 and packet.cmdSet == 0xFE and packet.cmdId == 0x15:
                 p = pr705_pb2.DisplayPropertyUpload()
                 p.ParseFromString(packet.payload)
                 processed = True
                 send_reply = False
                 print("pr705 DisplayPropertyUpload:", str(p))
+
+                p = pd335_bms_bp_pb2.BMSHeartBeatReport()
+                p.ParseFromString(packet.payload)
+                print(f"report\n{str(p)}")
+
+                p = pd335_sys_pb2.ConfigReadAck()
+                p.ParseFromString(packet.payload)
+                print(f"ack\n{str(p)}")
             if send_reply:
                 # We need to resend packets back to device to enable device to send the additional info
                 await self.replyPacket(packet)
@@ -740,6 +768,18 @@ class Connection:
         ppas.is_get_cfg_flag = enable
         payload = ppas.SerializeToString()
         packet = Packet(0x21, 0x0B, 0x0C, 0x21, payload, 0x01, 0x01, 0x13)
+
+        await self.sendPacket(packet)
+
+    async def set_backup_soc_level(self, value: int):
+        config = pr705_pb2.ConfigWrite()
+        cfg_backup = pr705_pb2.CfgEnergyBackup()
+        cfg_backup.energy_backup_en = True
+        cfg_backup.energy_backup_start_soc = value
+        config.cfg_energy_backup = cfg_backup
+        payload = config.SerializeToString()
+
+        packet = Packet(0x20, 0x02, 0xFE, 0x11, payload, 0x01, 0x01, 0x13)
 
         await self.sendPacket(packet)
 
